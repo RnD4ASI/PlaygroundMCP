@@ -61,7 +61,199 @@ from mlx_lm import load as mlx_load, generate as mlx_generate
 from src.pipeline.shared.logging import get_logger
 from src.pipeline.shared.utility import DataUtility, StatisticsUtility, AIUtility, MemoryUtility
 
+
+# --- MCP Client Imports ---
+import asyncio
+import nest_asyncio
+from contextlib import AsyncExitStack
+import json # Added json import
+from typing import List, Optional, Dict, Any, Union, Tuple # Ensure these are available for MCPClientManager
+from pathlib import Path # Ensure Path is available if server_config_path could be Path
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+# --- End MCP Client Imports ---
+
 logger = get_logger(__name__)
+
+# Apply nest_asyncio to allow running asyncio code from synchronous generator methods
+nest_asyncio.apply()
+
+
+class MCPClientManager:
+    """
+    Manages connections to MCP servers and discovery of available tools.
+    This is used by Generator when interacting with LLMs that support tool calling.
+    """
+    def __init__(self, server_config_path="server_config.json"):
+        self.server_config_path = server_config_path
+        self.exit_stack = None
+        self.sessions: Dict[str, ClientSession] = {} # Maps server name to session
+        self.tool_to_session_map: Dict[str, ClientSession] = {} # Maps tool name to its session
+        self.available_tools: List[Dict[str, Any]] = [] # Tool schemas for LLM
+        self._initialized = False
+        self._initializing = False # Lock to prevent re-entrant initialization
+
+    async def _initialize_stack(self):
+        if self.exit_stack is None:
+            self.exit_stack = AsyncExitStack()
+            await self.exit_stack.__aenter__()
+
+    async def connect_to_server(self, server_name: str, server_config: Dict[str, Any]):
+        """Connects to a single MCP server and populates tools."""
+        if server_name in self.sessions:
+            logger.info(f"Already connected to MCP server: {server_name}")
+            return
+
+        try:
+            logger.info(f"Connecting to MCP server: {server_name} with config {server_config}")
+            server_params = StdioServerParameters(**server_config)
+
+            await self._initialize_stack() # Ensure stack is ready
+
+            stdio_transport = await self.exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            read, write = stdio_transport
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(read, write)
+            )
+            await session.initialize()
+            self.sessions[server_name] = session
+            logger.info(f"Successfully connected to MCP server: {server_name}")
+
+            response = await session.list_tools()
+            if response and response.tools:
+                for tool in response.tools:
+                    if tool.name in self.tool_to_session_map:
+                        logger.warning(f"Tool '{tool.name}' from server '{server_name}' conflicts with an existing tool. Check MCP server configurations.")
+                    self.tool_to_session_map[tool.name] = session
+                    self.available_tools.append({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.inputSchema
+                    })
+                logger.info(f"Discovered {len(response.tools)} tools from {server_name}.")
+            else:
+                logger.info(f"No tools discovered from {server_name}.")
+
+
+        except Exception as e:
+            logger.error(f"Failed to connect or discover tools from MCP server {server_name}: {e}")
+            # Optionally, remove server from sessions if connection failed mid-way
+            if server_name in self.sessions:
+                del self.sessions[server_name]
+
+
+    async def connect_to_all_servers(self):
+        if self._initialized or self._initializing:
+            return
+
+        self._initializing = True
+        logger.info("MCPClientManager: Starting connection to all servers...")
+        await self._initialize_stack()
+
+        try:
+            # Ensure current working directory is predictable or use absolute path for server_config.json
+            config_file = Path(self.server_config_path)
+            if not config_file.is_absolute():
+                # Assuming generator.py is in the root of the project for this example
+                config_file = Path(__file__).parent / self.server_config_path
+
+            logger.info(f"Attempting to load MCP server configuration from: {config_file}")
+            with open(config_file, "r") as f:
+                config_data = json.load(f)
+
+            mcp_servers_config = config_data.get("mcpServers", {})
+            if not mcp_servers_config:
+                logger.warning(f"No MCP servers found in {config_file}.")
+                self._initialized = True
+                self._initializing = False
+                return
+
+            # Filter out generator_config_server to prevent self-connection issues
+            # and research_server if its tools are now in common_tools
+            servers_to_connect = {
+                name: cfg for name, cfg in mcp_servers_config.items()
+                # if name not in ["generator_config", "research_server"] # Adjust if research_server is fully merged
+            }
+            if not servers_to_connect:
+                logger.info("No applicable MCP servers to connect to after filtering.")
+
+
+            for server_name, server_cfg in servers_to_connect.items():
+                await self.connect_to_server(server_name, server_cfg)
+
+            self._initialized = True
+            logger.info(f"MCPClientManager initialized. Found {len(self.available_tools)} tools across configured servers.")
+
+        except FileNotFoundError:
+            logger.error(f"MCP server configuration file not found: {config_file}")
+        except Exception as e:
+            logger.error(f"Error initializing MCPClientManager during connect_to_all_servers: {e}", exc_info=True)
+        finally:
+            self._initializing = False
+
+
+    async def get_tool_session(self, tool_name: str) -> Optional[ClientSession]:
+        if not self._initialized:
+            logger.warning("MCPClientManager not initialized when get_tool_session was called. Attempting lazy initialization.")
+            await self.connect_to_all_servers() # Or self.ensure_initialized() if preferred sync wrapper
+
+        session = self.tool_to_session_map.get(tool_name)
+        if not session:
+            logger.error(f"Tool '{tool_name}' not found in any connected MCP server session.")
+        return session
+
+    async def close_connections(self):
+        if self.exit_stack:
+            logger.info("MCPClientManager: Closing connections...")
+            try:
+                await self.exit_stack.aclose()
+            except Exception as e:
+                logger.error(f"Error during MCPClientManager exit_stack.aclose(): {e}")
+            finally:
+                self.exit_stack = None
+                self.sessions.clear()
+                self.tool_to_session_map.clear()
+                self.available_tools.clear()
+                self._initialized = False
+                self._initializing = False
+                logger.info("MCPClientManager connections closed and reset.")
+        else:
+            logger.info("MCPClientManager: No active connections to close.")
+
+
+    def ensure_initialized(self):
+        """Synchronous wrapper to ensure async initialization is run if needed."""
+        if self._initialized or self._initializing:
+            return
+
+        logger.info("MCPClientManager not initialized. Initializing synchronously...")
+        try:
+            # Check if an event loop is already running.
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+            if loop.is_running():
+                logger.warning("Asyncio loop already running. Submitting connect_to_all_servers to the running loop.")
+                # This is tricky. If called from a sync context with a running loop,
+                # we can't just `asyncio.run()`. We might need a more complex setup
+                # or rely on `nest_asyncio` heavily.
+                # For now, let's assume nest_asyncio handles this if it's a nested call.
+                # If this is the *outermost* sync call starting things, asyncio.run() is fine.
+                asyncio.run(self.connect_to_all_servers()) # nest_asyncio should allow this
+            else:
+                asyncio.run(self.connect_to_all_servers())
+        except RuntimeError as e:
+            if "cannot be called when another asyncio event loop is running" in str(e) or \
+               "Nesting asyncio.run() is not supported" in str(e):
+                logger.warning(f"Asyncio context issue during ensure_initialized: {e}. nest_asyncio might be needed or initialization strategy revised.")
+            else:
+                logger.error(f"RuntimeError during MCPClientManager synchronous initialization: {e}", exc_info=True)
+                # raise # Optionally re-raise
+        except Exception as e:
+            logger.error(f"Critical error during MCPClientManager synchronous initialization: {e}", exc_info=True)
+            # raise # Optionally re-raise
+
 
 class Generator:
     """Handles model interactions and text generation.
@@ -91,6 +283,13 @@ class Generator:
     def _real_init(self):
         """Actual initialization logic (called only once)."""
         logger.info("Initializing SINGLETON Generator instance")
+
+        # Initialize MCP Client Manager
+        # It's crucial this path is correct relative to where generator.py might be run from,
+        # or an absolute path is used, or server_config.json is in PYTHONPATH.
+        # For now, assuming server_config.json is in the same directory as generator.py or configured in PYTHONPATH.
+        self.mcp_client_manager = MCPClientManager(server_config_path="server_config.json")
+        self.mcp_client_manager.ensure_initialized()
         
         # Initialize utilities
         self.datautility = DataUtility()
@@ -3408,4 +3607,339 @@ class Encoder:
             reranked_pairs = reranked_pairs[:top_k]
             
         return reranked_pairs
-    
+
+    # --- Agentic Methods ---
+
+    def get_agentic(self,
+                    prompt: str,
+                    prompt_id: Optional[int] = None,
+                    system_prompt: Optional[str] = None,
+                    model: Optional[str] = None,
+                    return_full_response: Optional[bool] = False,
+                    **kwargs) -> Union[Dict[str, Any], str]:
+        """
+        Orchestrates an agentic interaction with an LLM, potentially involving multiple
+        tool calls via MCP, and returns the final response.
+        """
+        logger.info(f"get_agentic called with model: {model}, prompt: '{prompt[:100]}...'")
+
+        if model is None:
+            try: # Default to a capable Anthropic model if available
+                model = self.model_config["validation_rules"]["models"]["completion"]["anthropic"][0]
+                logger.warning(f"Model not specified for get_agentic, defaulting to Anthropic model: {model}")
+            except (KeyError, IndexError, TypeError):
+                logger.warning("No default Anthropic model found in config for get_agentic. Trying general default.")
+                model = self.default_completion_model
+                if not model:
+                    raise ValueError("No model specified and no default agentic model could be determined for get_agentic.")
+                logger.warning(f"Falling back to general default completion model for get_agentic: {model}")
+
+        # Prepare initial messages list, common for chat-based models
+        initial_messages = [{"role": "user", "content": prompt}]
+
+        agentic_kwargs = {
+            "prompt_id": prompt_id,
+            "system_prompt": system_prompt,
+            "return_full_response": return_full_response,
+            **kwargs
+        }
+
+        # Route to the correct provider-specific agentic method
+        if self._validate_model(model, "completion", "anthropic"):
+            logger.debug(f"Routing to _get_claude_agentic for model {model}")
+            return self._get_claude_agentic(model=model, initial_messages=initial_messages, **agentic_kwargs)
+        elif self._validate_model(model, "completion", "azure_openai"):
+            logger.debug(f"Routing to _get_azure_agentic for model {model}")
+            return self._get_azure_agentic(model=model, initial_messages=initial_messages, **agentic_kwargs)
+        elif self._validate_model(model, "completion", "vertex"): # Gemini
+            logger.debug(f"Routing to _get_gemini_agentic for model {model}")
+            return self._get_gemini_agentic(model=model, initial_messages=initial_messages, **agentic_kwargs)
+        elif self._validate_model(model, "completion", "huggingface"):
+            logger.debug(f"Routing to _get_hf_agentic for model {model}")
+            # For HF, initial_messages might need to be converted to a flat prompt string
+            return self._get_hf_agentic(model=model, initial_prompt_text=prompt, **agentic_kwargs)
+        else:
+            logger.error(f"Unsupported model or provider for get_agentic: {model}. Check model_config.json.")
+            raise ValueError(f"Model {model} is not configured for agentic calls with a known provider.")
+
+    def _get_claude_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[Dict[str, Any], str]:
+        """
+        Handles agentic interaction with an Anthropic Claude model, including MCP tool calls.
+        """
+        logger.info(f"Executing Claude agentic call for model {model}")
+        self.mcp_client_manager.ensure_initialized()
+
+        temperature = kwargs.get('temperature', 0.7)
+        max_tokens = kwargs.get('max_tokens', 2048)
+        top_p = kwargs.get('top_p', None)
+        system_prompt = kwargs.get('system_prompt', None)
+        prompt_id = kwargs.get('prompt_id', None)
+        initial_prompt_text = initial_messages[0]['content'] if initial_messages and initial_messages[0]['role'] == 'user' else ""
+        return_full_response = kwargs.get('return_full_response', False)
+
+        client = Anthropic(api_key=self.claude_api_key)
+        if not self.claude_api_key:
+            raise ValueError("Anthropic Claude API key is not set.")
+
+        final_response_text = ""
+        accumulated_input_tokens = 0
+        accumulated_output_tokens = 0
+        MAX_TOOL_CALLS = kwargs.get('max_tool_calls', 5)
+        tool_calls_count = 0
+        current_messages_history = [msg for msg in initial_messages]
+
+        while tool_calls_count < MAX_TOOL_CALLS:
+            api_params = {
+                "model": model, "max_tokens": max_tokens, "messages": current_messages_history,
+                "system": system_prompt, "temperature": temperature,
+            }
+            if top_p is not None: api_params["top_p"] = top_p
+
+            if self.mcp_client_manager.available_tools:
+                api_params["tools"] = self.mcp_client_manager.available_tools
+                logger.info(f"Claude Agentic: Passing {len(self.mcp_client_manager.available_tools)} tools to Claude API.")
+            else:
+                logger.info("Claude Agentic: No MCP tools available/loaded to pass to Claude API.")
+
+            logger.debug(f"Claude API call ({tool_calls_count + 1}) with messages: {current_messages_history}")
+            response = client.messages.create(**api_params)
+
+            if response.usage:
+                accumulated_input_tokens += response.usage.input_tokens
+                accumulated_output_tokens += response.usage.output_tokens
+
+            has_tool_use_this_turn = False
+            assistant_turn_content_blocks_for_history = []
+
+            for content_block in response.content:
+                # Add raw block to what assistant said this turn (for history)
+                assistant_turn_content_blocks_for_history.append(content_block.model_dump())
+
+                if content_block.type == 'text':
+                    logger.debug(f"Claude agentic text response block: {content_block.text}")
+                elif content_block.type == 'tool_use':
+                    has_tool_use_this_turn = True
+                    tool_name, tool_use_id, tool_input = content_block.name, content_block.id, content_block.input
+                    logger.info(f"Claude agentic requested tool: {tool_name} (ID: {tool_use_id}) with input: {tool_input}")
+
+                    tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(tool_name))
+                    tool_result_content_str, is_error_result = "", False
+
+                    if tool_session:
+                        try:
+                            mcp_tool_result = asyncio.run(tool_session.call_tool(tool_name, arguments=tool_input))
+                            tool_result_content_str = json.dumps(mcp_tool_result.content) if isinstance(mcp_tool_result.content, (dict, list)) else str(mcp_tool_result.content)
+                            logger.info(f"Tool '{tool_name}' executed. Result content preview: {tool_result_content_str[:200]}...")
+                        except Exception as e:
+                            logger.error(f"Error calling MCP tool {tool_name} via Claude Agentic: {e}", exc_info=True)
+                            tool_result_content_str, is_error_result = f"Error executing tool {tool_name}: {str(e)}", True
+                    else:
+                        tool_result_content_str, is_error_result = f"Tool {tool_name} is not available or configured.", True
+                        logger.warning(f"Tool {tool_name} requested by Claude agentic not found.")
+
+                    current_messages_history.append({"role": "assistant", "content": assistant_turn_content_blocks_for_history})
+                    tool_result_msg_content = {"type": "tool_result", "tool_use_id": tool_use_id, "content": tool_result_content_str}
+                    if is_error_result: tool_result_msg_content["is_error"] = True
+                    current_messages_history.append({"role": "user", "content": [tool_result_msg_content]})
+
+                    assistant_turn_content_blocks_for_history = [] # Reset for next iteration
+                    break
+
+            if not has_tool_use_this_turn:
+                final_response_text = " ".join(b.get("text","") for b in assistant_turn_content_blocks_for_history if b.get("type") == "text")
+                if assistant_turn_content_blocks_for_history:
+                    current_messages_history.append({"role": "assistant", "content": assistant_turn_content_blocks_for_history})
+                logger.info(f"Claude agentic call finished. Final text: {final_response_text[:200]}...")
+                break
+
+            tool_calls_count += 1
+            if tool_calls_count >= MAX_TOOL_CALLS:
+                logger.warning("Reached maximum tool calls for Claude agentic interaction.")
+                final_response_text = "Reached maximum tool calls."
+                if assistant_turn_content_blocks_for_history: # Likely the tool_use block that hit limit
+                     current_messages_history.append({"role": "assistant", "content": assistant_turn_content_blocks_for_history})
+                break
+
+        if return_full_response:
+            return {"prompt_id": prompt_id, "prompt": initial_prompt_text, "response": final_response_text,
+                    "full_conversation_history": current_messages_history, "tokens_in": accumulated_input_tokens,
+                    "tokens_out": accumulated_output_tokens, "model": model, "temperature": temperature,
+                    "top_p": top_p, "tool_calls_made": tool_calls_count}
+        return final_response_text
+
+    def _get_hf_agentic(self, model: str, initial_prompt_text: str, **kwargs) -> Union[Dict[str, Any], str]:
+        logger.warning(f"HuggingFace agentic calls for model {model} are not yet implemented.")
+        raise NotImplementedError(f"HuggingFace agentic calls for model {model} are not yet implemented.")
+
+    def _get_azure_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[Dict[str, Any], str]:
+        """
+        Handles agentic interaction with an Azure OpenAI model, including MCP tool calls
+        using Azure's function/tool calling capabilities.
+        """
+        logger.info(f"Executing Azure OpenAI agentic call for model {model} (deployment ID)")
+        self.mcp_client_manager.ensure_initialized()
+
+        if not self.azure_endpoint or not (self.client_secret or self.subscription_key or os.getenv("AZURE_OPENAI_API_KEY")): # Check for API key too
+            # Allowing AZURE_OPENAI_API_KEY as a common way to set the key directly
+            raise ValueError("Azure OpenAI credentials (Entra ID or API Key) or endpoint not fully configured for agentic calls.")
+
+        temperature = kwargs.get('temperature', 0.7)
+        max_tokens_completion = kwargs.get('max_tokens', 2048) # Azure's max_tokens is for the completion part
+        top_p = kwargs.get('top_p', None)
+        system_prompt_content = kwargs.get('system_prompt', None)
+        prompt_id = kwargs.get('prompt_id', None)
+        initial_prompt_text = initial_messages[0]['content'] if initial_messages and initial_messages[0]['role'] == 'user' else ""
+        return_full_response = kwargs.get('return_full_response', False)
+
+        # Initialize AzureOpenAI client - supports both Entra ID (token) and API Key
+        if self.tenant_id and self.client_id and self.client_secret : # Entra ID
+            access_token = self.refresh_token()
+            client = AzureOpenAI(
+                api_version=self.api_version,
+                azure_endpoint=self.azure_endpoint,
+                azure_ad_token=access_token
+            )
+            logger.info("Using Entra ID (token) for Azure OpenAI authentication.")
+        elif os.getenv("AZURE_OPENAI_API_KEY"): # API Key
+            client = AzureOpenAI(
+                api_version=self.api_version,
+                azure_endpoint=self.azure_endpoint,
+                api_key=os.getenv("AZURE_OPENAI_API_KEY")
+            )
+            logger.info("Using API Key for Azure OpenAI authentication.")
+        else: # Fallback if only subscription key was set for some other legacy reason (less common for chat)
+             client = AzureOpenAI(
+                api_version=self.api_version,
+                azure_endpoint=self.azure_endpoint,
+                api_key=self.subscription_key
+            )
+             logger.warning("Using subscription_key as API key for Azure OpenAI. Ensure this is intended.")
+
+
+        final_response_text = ""
+        # Azure's usage field in response is more complex; direct accumulation might not be straightforward.
+        # We'd typically sum prompt_tokens and completion_tokens from each API call if needed.
+        accumulated_prompt_tokens = 0
+        accumulated_completion_tokens = 0
+
+        MAX_TOOL_CALLS = kwargs.get('max_tool_calls', 5)
+        tool_calls_count = 0
+
+        current_messages_history = []
+        if system_prompt_content:
+            current_messages_history.append({"role": "system", "content": system_prompt_content})
+        current_messages_history.extend(initial_messages)
+
+        azure_tools_formatted = []
+        if self.mcp_client_manager.available_tools:
+            for mcp_tool in self.mcp_client_manager.available_tools:
+                try:
+                    azure_tools_formatted.append({
+                        "type": "function",
+                        "function": {
+                            "name": mcp_tool["name"],
+                            "description": mcp_tool["description"],
+                            "parameters": mcp_tool["input_schema"] # Assuming MCP schema is compatible
+                        }
+                    })
+                except KeyError as e:
+                    logger.warning(f"Skipping MCP tool {mcp_tool.get('name', 'Unknown')} for Azure due to schema issue: {e}")
+            logger.info(f"Azure Agentic: Formatted {len(azure_tools_formatted)} tools for Azure API.")
+        else:
+            logger.info("Azure Agentic: No MCP tools available/loaded.")
+
+        while tool_calls_count < MAX_TOOL_CALLS:
+            api_params = {
+                "model": model, # Azure deployment ID
+                "messages": current_messages_history,
+                "temperature": temperature,
+                "max_tokens": max_tokens_completion,
+            }
+            if top_p is not None: api_params["top_p"] = top_p
+            if azure_tools_formatted: api_params["tools"] = azure_tools_formatted
+            # api_params["tool_choice"] = "auto" # Default
+
+            logger.debug(f"Azure API call ({tool_calls_count + 1}) with messages: {current_messages_history}")
+            chat_response = client.chat.completions.create(**api_params)
+
+            if chat_response.usage: # Accumulate tokens
+                 accumulated_prompt_tokens += chat_response.usage.prompt_tokens
+                 accumulated_completion_tokens += chat_response.usage.completion_tokens
+
+            response_message = chat_response.choices[0].message
+            # Add assistant's response (which might include tool_calls) to history
+            current_messages_history.append(response_message.model_dump(exclude_none=True))
+
+
+            if response_message.tool_calls:
+                logger.info(f"Azure OpenAI requested tool_calls: {response_message.tool_calls}")
+                for tool_call in response_message.tool_calls:
+                    if tool_call.type == "function":
+                        function_name = tool_call.function.name
+                        function_args_str = tool_call.function.arguments # This is a string
+                        tool_call_id = tool_call.id
+
+                        logger.info(f"Azure Agentic: Function call to '{function_name}' (ID: {tool_call_id}) with args string: {function_args_str}")
+
+                        try:
+                            # Arguments from Azure are a JSON string
+                            function_args_dict = json.loads(function_args_str)
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse JSON arguments for {function_name}: {function_args_str}")
+                            tool_result_content = f"Error: Could not parse arguments for {function_name}."
+                        else:
+                            tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(function_name))
+                            if tool_session:
+                                try:
+                                    mcp_tool_result = asyncio.run(tool_session.call_tool(function_name, arguments=function_args_dict))
+                                    # Azure expects tool output as a string
+                                    tool_result_content = json.dumps(mcp_tool_result.content) if isinstance(mcp_tool_result.content, (dict, list)) else str(mcp_tool_result.content)
+                                    logger.info(f"MCP Tool '{function_name}' executed. Result preview: {tool_result_content[:100]}...")
+                                except Exception as e:
+                                    logger.error(f"Error calling MCP tool {function_name} via Azure: {e}", exc_info=True)
+                                    tool_result_content = f"Error executing tool {function_name}: {str(e)}"
+                            else:
+                                tool_result_content = f"Tool {function_name} is not available or configured."
+                                logger.warning(f"Tool {function_name} requested by Azure not found in MCPClientManager.")
+
+                        # Append the tool result message to history for the next API call
+                        current_messages_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": function_name,
+                            "content": tool_result_content
+                        })
+
+                tool_calls_count += 1 # Increment after processing all tool calls in a turn
+                if tool_calls_count >= MAX_TOOL_CALLS:
+                    logger.warning("Reached maximum tool calls for Azure agentic interaction.")
+                    final_response_text = "Reached maximum tool calls; processing stopped."
+                    break
+                # Continue to the next iteration of the while loop to send tool results to Azure
+                continue
+            else: # No tool_calls in the response_message
+                final_response_text = response_message.content if response_message.content else ""
+                logger.info(f"Azure agentic call finished. Final text: {final_response_text[:200]}...")
+                break # Exit while loop
+
+        if return_full_response:
+            return {"prompt_id": prompt_id, "prompt": initial_prompt_text, "response": final_response_text,
+                    "full_conversation_history": current_messages_history,
+                    "tokens_in": accumulated_prompt_tokens,
+                    "tokens_out": accumulated_completion_tokens,
+                    "model": model, "temperature": temperature, "top_p": top_p,
+                    "tool_calls_made": tool_calls_count}
+        return final_response_text
+
+    def _get_gemini_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[Dict[str, Any], str]:
+        logger.warning(f"Google Gemini agentic calls for model {model} are not yet implemented.")
+        raise NotImplementedError(f"Google Gemini agentic calls for model {model} are not yet implemented.")
+
+# Make sure the original _get_claude_completion (previously _get_anthropic_completion) is the standard non-agentic one.
+# Based on the file content, it's named _get_claude_completion. Let's ensure it's correct.
+# If _get_anthropic_completion was the old name, it should be restored to its simple form.
+# The existing _get_claude_completion seems to be the simple one already.
+
+# The Encoder class and MetaGenerator class would follow here if they are part of this file.
+# For this operation, we are only adding methods to the Generator class.
+# No __main__ block for MCP server in generator.py anymore.

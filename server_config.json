@@ -18,7 +18,18 @@
         "fetch": {
             "command": "uvx",
             "args": ["mcp-server-fetch"]
+        },
+        "common_tools": {
+            "command": "python",
+            "args": ["common_mcp_tools.py"]
+        },
+        "common_prompts": {
+            "command": "python",
+            "args": ["common_mcp_prompts.py"]
+        },
+        "generator_config": {
+            "command": "python",
+            "args": ["generator_mcp_config_server.py"]
         }
     }
 }
-  
