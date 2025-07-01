@@ -3898,7 +3898,55 @@ assistant_turn_content_blocks_for_history.append(content_block.model_dump())
                             tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(function_name))
                             if tool_session:
                                 try:
-                                    mcp_tool_result = asyncio.run(tool_session.call_tool(function_name, arguments=function_args_dict))
+def _get_azure_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[Dict[str, Any], str]:
+        # ... (previous code remains unchanged)
+
+        while tool_calls_count < MAX_TOOL_CALLS:
+            # ... (previous code remains unchanged)
+
+            if response_message.tool_calls:
+                logger.info(f"Azure OpenAI requested tool_calls: {response_message.tool_calls}")
+                for tool_call in response_message.tool_calls:
+                    if tool_call.type == "function":
+                        function_name = tool_call.function.name
+                        function_args_str = tool_call.function.arguments # This is a string
+                        tool_call_id = tool_call.id
+
+                        logger.info(f"Azure Agentic: Function call to '{function_name}' (ID: {tool_call_id}) with args string: {function_args_str}")
+
+                        try:
+                            # Arguments from Azure are a JSON string
+                            function_args_dict = json.loads(function_args_str)
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse JSON arguments for {function_name}: {function_args_str}")
+                            tool_result_content = f"Error: Could not parse arguments for {function_name}."
+                        else:
+                            tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(function_name))
+                            if tool_session:
+                                try:
+                                    # Use shlex.quote to sanitize function_name and json.dumps for function_args_dict
+                                    sanitized_function_name = shlex.quote(function_name)  # import shlex
+                                    sanitized_args = json.dumps(function_args_dict)
+                                    mcp_tool_result = asyncio.run(tool_session.call_tool(sanitized_function_name, arguments=json.loads(sanitized_args)))
+                                    # Azure expects tool output as a string
+                                    tool_result_content = json.dumps(mcp_tool_result.content) if isinstance(mcp_tool_result.content, (dict, list)) else str(mcp_tool_result.content)
+                                    logger.info(f"MCP Tool '{function_name}' executed. Result preview: {tool_result_content[:100]}...")
+                                except Exception as e:
+                                    logger.error(f"Error calling MCP tool {function_name} via Azure: {e}", exc_info=True)
+                                    tool_result_content = f"Error executing tool {function_name}: {str(e)}"
+                            else:
+                                tool_result_content = f"Tool {function_name} is not available or configured."
+                                logger.warning(f"Tool {function_name} requested by Azure not found in MCPClientManager.")
+
+                        # Append the tool result message to history for the next API call
+                        current_messages_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": function_name,
+                            "content": tool_result_content
+                        })
+
+                # ... (rest of the code remains unchanged)
                                     # Azure expects tool output as a string
                                     tool_result_content = json.dumps(mcp_tool_result.content) if isinstance(mcp_tool_result.content, (dict, list)) else str(mcp_tool_result.content)
                                     logger.info(f"MCP Tool '{function_name}' executed. Result preview: {tool_result_content[:100]}...")
