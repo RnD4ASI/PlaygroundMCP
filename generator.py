@@ -3716,7 +3716,14 @@ class Encoder:
                 assistant_turn_content_blocks_for_history.append(content_block.model_dump())
 
                 if content_block.type == 'text':
-                    logger.debug(f"Claude agentic text response block: {content_block.text}")
+assistant_turn_content_blocks_for_history.append(content_block.model_dump())
+
+                if content_block.type == 'text':
+                    # import html
+                    logger.debug(f"Claude agentic text response block: {html.escape(content_block.text)}")  # Sanitize log input
+                elif content_block.type == 'tool_use':
+                    has_tool_use_this_turn = True
+                    tool_name, tool_use_id, tool_input = content_block.name, content_block.id, content_block.input
                 elif content_block.type == 'tool_use':
                     has_tool_use_this_turn = True
                     tool_name, tool_use_id, tool_input = content_block.name, content_block.id, content_block.input
