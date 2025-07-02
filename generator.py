@@ -57,9 +57,60 @@ from google.generativeai import types
 from anthropic import Anthropic
 from mistralai import Mistral
 # Optional MLX support for Apple-Silicon / CPU inference
-from mlx_lm import load as mlx_load, generate as mlx_generate
+try:
+    from mlx_lm import load as mlx_load, generate as mlx_generate
+except ImportError:
+    mlx_load, mlx_generate = None, None
+    logger.debug("mlx_lm not found, MLX support disabled.")
+
+# Google Gemini imports (ensure they are here)
+import google.generativeai as genai
+from google.generativeai import types as genai_types
+
 from src.pipeline.shared.logging import get_logger
 from src.pipeline.shared.utility import DataUtility, StatisticsUtility, AIUtility, MemoryUtility
+
+# --- Type Definitions for Standardized Agentic Responses ---
+from typing import TypedDict, List, Union, Optional, Any
+
+# No longer using StandardizedToolCall directly in StandardizedMessage,
+# tool call info is part of StandardizedMessageContentPart with type="tool_use"
+
+class StandardizedMessageContentPart(TypedDict, total=False): # total=False allows for optional keys
+    type: str # "text", "tool_use" (assistant requests tool), "tool_result" (user/system provides tool output)
+
+    # Common fields
+    text: Optional[str] # For type="text"
+
+    # For type="tool_use" (assistant's request to call a tool)
+    id: Optional[str] # Unique ID for this specific tool call suggestion
+    name: Optional[str] # Name of the tool to be called
+    input: Optional[Dict[str, Any]] # Parsed arguments for the tool
+
+    # For type="tool_result" (response from a tool execution)
+    tool_use_id: Optional[str] # ID of the tool_use request this result corresponds to
+    # content for tool_result can be a string (e.g. simple output or error message) or structured JSON
+    content: Optional[Union[str, Dict[str, Any], List[Any]]]
+    is_error: Optional[bool] # True if the tool execution resulted in an error
+
+class StandardizedMessage(TypedDict):
+    role: str  # "user", "assistant", "tool"
+    content: Union[str, List[StandardizedMessageContentPart]] # str for simple text messages, list of content parts for complex messages
+    name: Optional[str] # Optional: For "tool" role, name of the tool. For "assistant", model's name if it has one.
+
+class StandardizedAgenticResponse(TypedDict):
+    prompt_id: Optional[int]
+    prompt: str  # The initial user prompt text
+    response: str  # The final textual response from the LLM
+    full_conversation_history: List[StandardizedMessage]
+    tokens_in: Optional[int]
+    tokens_out: Optional[int]
+    model: str
+    temperature: Optional[float]
+    top_p: Optional[float]
+    top_k: Optional[int]
+    tool_calls_made: int
+# --- End Type Definitions ---
 
 
 # --- MCP Client Imports ---
@@ -3616,10 +3667,28 @@ class Encoder:
                     system_prompt: Optional[str] = None,
                     model: Optional[str] = None,
                     return_full_response: Optional[bool] = False,
-                    **kwargs) -> Union[Dict[str, Any], str]:
+                    **kwargs) -> Union[StandardizedAgenticResponse, str]:
         """
         Orchestrates an agentic interaction with an LLM, potentially involving multiple
         tool calls via MCP, and returns the final response.
+
+        Args:
+            prompt (str): The initial user prompt.
+            prompt_id (Optional[int]): An optional ID for the prompt.
+            system_prompt (Optional[str]): An optional system prompt to guide the model.
+            model (Optional[str]): The specific model to use. If None, a default will be chosen.
+            return_full_response (Optional[bool]): If True, returns a StandardizedAgenticResponse TypedDict.
+                                                 If False (default), returns only the final response string.
+            **kwargs: Additional keyword arguments passed to the underlying provider-specific methods
+                      (e.g., temperature, max_tokens, top_p, top_k, max_tool_calls).
+
+        Returns:
+            Union[StandardizedAgenticResponse, str]:
+                If return_full_response is True, returns a StandardizedAgenticResponse TypedDict
+                containing detailed information about the interaction, including the full
+                standardized conversation history and token counts.
+                If return_full_response is False, returns the final textual response string from the LLM.
+        """
         """
         logger.info(f"get_agentic called with model: {model}, prompt: '{prompt[:100]}...'")
 
@@ -3662,9 +3731,19 @@ class Encoder:
             logger.error(f"Unsupported model or provider for get_agentic: {model}. Check model_config.json.")
             raise ValueError(f"Model {model} is not configured for agentic calls with a known provider.")
 
-    def _get_claude_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[Dict[str, Any], str]:
+    def _get_claude_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[StandardizedAgenticResponse, str]:
         """
         Handles agentic interaction with an Anthropic Claude model, including MCP tool calls.
+        Returns a standardized response structure if `return_full_response` is True in kwargs.
+
+        Args:
+            model (str): The Claude model name.
+            initial_messages (List[Dict[str, str]]): The initial messages for the conversation.
+            **kwargs: See `get_agentic` for other relevant kwargs like `return_full_response`,
+                      `prompt_id`, `system_prompt`, `temperature`, `max_tokens`, etc.
+
+        Returns:
+            Union[StandardizedAgenticResponse, str]: Standardized response or final text string.
         """
         logger.info(f"Executing Claude agentic call for model {model}")
         self.mcp_client_manager.ensure_initialized()
@@ -3686,22 +3765,30 @@ class Encoder:
         accumulated_output_tokens = 0
         MAX_TOOL_CALLS = kwargs.get('max_tool_calls', 5)
         tool_calls_count = 0
-        current_messages_history = [msg for msg in initial_messages]
+
+        # History for Claude API (native format)
+        claude_api_history = [msg for msg in initial_messages]
+        # History for standardized output
+        standardized_history: List[StandardizedMessage] = []
+        for msg in initial_messages: # Convert initial messages
+            standardized_history.append(StandardizedMessage(role=msg["role"], content=msg["content"]))
+
 
         while tool_calls_count < MAX_TOOL_CALLS:
             api_params = {
-                "model": model, "max_tokens": max_tokens, "messages": current_messages_history,
+                "model": model, "max_tokens": max_tokens, "messages": claude_api_history,
                 "system": system_prompt, "temperature": temperature,
             }
             if top_p is not None: api_params["top_p"] = top_p
 
             if self.mcp_client_manager.available_tools:
+                # Claude tools are directly compatible with MCP tool schema (name, description, input_schema)
                 api_params["tools"] = self.mcp_client_manager.available_tools
                 logger.info(f"Claude Agentic: Passing {len(self.mcp_client_manager.available_tools)} tools to Claude API.")
             else:
                 logger.info("Claude Agentic: No MCP tools available/loaded to pass to Claude API.")
 
-            logger.debug(f"Claude API call ({tool_calls_count + 1}) with messages: {current_messages_history}")
+            logger.debug(f"Claude API call ({tool_calls_count + 1}) with messages: {claude_api_history}")
             response = client.messages.create(**api_params)
 
             if response.usage:
@@ -3709,133 +3796,434 @@ class Encoder:
                 accumulated_output_tokens += response.usage.output_tokens
 
             has_tool_use_this_turn = False
-            assistant_turn_content_blocks_for_history = []
+
+            # Process response content blocks for Claude API history and Standardized History
+            assistant_api_content_blocks = [] # For Claude API history
+            assistant_standardized_content_parts: List[StandardizedMessageContentPart] = [] # For Standardized History
 
             for content_block in response.content:
-                # Add raw block to what assistant said this turn (for history)
-                assistant_turn_content_blocks_for_history.append(content_block.model_dump())
+                assistant_api_content_blocks.append(content_block.model_dump()) # For Claude's history
 
                 if content_block.type == 'text':
-assistant_turn_content_blocks_for_history.append(content_block.model_dump())
+                    logger.debug(f"Claude agentic text response block: {content_block.text}")
+                    assistant_standardized_content_parts.append(StandardizedMessageContentPart(type="text", text=content_block.text))
 
-                if content_block.type == 'text':
-                    # import html
-                    logger.debug(f"Claude agentic text response block: {html.escape(content_block.text)}")  # Sanitize log input
-                elif content_block.type == 'tool_use':
-                    has_tool_use_this_turn = True
-                    tool_name, tool_use_id, tool_input = content_block.name, content_block.id, content_block.input
                 elif content_block.type == 'tool_use':
                     has_tool_use_this_turn = True
                     tool_name, tool_use_id, tool_input = content_block.name, content_block.id, content_block.input
                     logger.info(f"Claude agentic requested tool: {tool_name} (ID: {tool_use_id}) with input: {tool_input}")
 
+                    assistant_standardized_content_parts.append(StandardizedMessageContentPart(
+                        type="tool_use", id=tool_use_id, name=tool_name, input=tool_input
+                    ))
+
+                    # Add assistant's response (including tool_use) to Claude API history *before* calling the tool
+                    claude_api_history.append({"role": "assistant", "content": assistant_api_content_blocks})
+                    # Also add to standardized history
+                    standardized_history.append(StandardizedMessage(role="assistant", content=assistant_standardized_content_parts))
+
+                    # Call the tool
                     tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(tool_name))
-                    tool_result_content_str, is_error_result = "", False
+                    tool_result_content_for_api, is_error_result = "", False
+                    tool_result_content_for_standardized: Union[str, Dict[str, Any], List[Any]]
 
                     if tool_session:
                         try:
                             mcp_tool_result = asyncio.run(tool_session.call_tool(tool_name, arguments=tool_input))
-                            tool_result_content_str = json.dumps(mcp_tool_result.content) if isinstance(mcp_tool_result.content, (dict, list)) else str(mcp_tool_result.content)
-                            logger.info(f"Tool '{tool_name}' executed. Result content preview: {tool_result_content_str[:200]}...")
+                            # For Claude API, content should be a string or JSON serializable dict/list
+                            if isinstance(mcp_tool_result.content, (dict, list)):
+                                tool_result_content_for_api = json.dumps(mcp_tool_result.content)
+                                tool_result_content_for_standardized = mcp_tool_result.content # Keep original structure
+                            else:
+                                tool_result_content_for_api = str(mcp_tool_result.content)
+                                tool_result_content_for_standardized = str(mcp_tool_result.content)
+                            logger.info(f"Tool '{tool_name}' executed. Result preview: {tool_result_content_for_api[:200]}...")
                         except Exception as e:
                             logger.error(f"Error calling MCP tool {tool_name} via Claude Agentic: {e}", exc_info=True)
-                            tool_result_content_str, is_error_result = f"Error executing tool {tool_name}: {str(e)}", True
+                            error_msg = f"Error executing tool {tool_name}: {str(e)}"
+                            tool_result_content_for_api, is_error_result = error_msg, True
+                            tool_result_content_for_standardized = {"error": error_msg}
                     else:
-                        tool_result_content_str, is_error_result = f"Tool {tool_name} is not available or configured.", True
+                        error_msg = f"Tool {tool_name} is not available or configured."
+                        tool_result_content_for_api, is_error_result = error_msg, True
+                        tool_result_content_for_standardized = {"error": error_msg}
                         logger.warning(f"Tool {tool_name} requested by Claude agentic not found.")
 
-                    current_messages_history.append({"role": "assistant", "content": assistant_turn_content_blocks_for_history})
-                    tool_result_msg_content = {"type": "tool_result", "tool_use_id": tool_use_id, "content": tool_result_content_str}
-                    if is_error_result: tool_result_msg_content["is_error"] = True
-                    current_messages_history.append({"role": "user", "content": [tool_result_msg_content]})
+                    # Prepare tool result for Claude API history
+                    claude_tool_result_msg_content = {"type": "tool_result", "tool_use_id": tool_use_id, "content": tool_result_content_for_api}
+                    if is_error_result: claude_tool_result_msg_content["is_error"] = True
+                    claude_api_history.append({"role": "user", "content": [claude_tool_result_msg_content]})
 
-                    assistant_turn_content_blocks_for_history = [] # Reset for next iteration
-                    break
+                    # Prepare tool result for Standardized History
+                    standardized_tool_result_part = StandardizedMessageContentPart(
+                        type="tool_result", tool_use_id=tool_use_id, content=tool_result_content_for_standardized
+                    )
+                    if is_error_result: standardized_tool_result_part["is_error"] = True
+                    standardized_history.append(StandardizedMessage(role="tool", name=tool_name, content=[standardized_tool_result_part]))
+
+                    assistant_api_content_blocks = [] # Reset for next potential assistant turn
+                    assistant_standardized_content_parts = []
+                    break # Break from content_block loop to re-prompt model with tool result
 
             if not has_tool_use_this_turn:
-                final_response_text = " ".join(b.get("text","") for b in assistant_turn_content_blocks_for_history if b.get("type") == "text")
-                if assistant_turn_content_blocks_for_history:
-                    current_messages_history.append({"role": "assistant", "content": assistant_turn_content_blocks_for_history})
+                # This is the final response from the assistant (no more tool calls this turn)
+                if assistant_api_content_blocks: # Should contain only text parts now
+                    claude_api_history.append({"role": "assistant", "content": assistant_api_content_blocks})
+                if assistant_standardized_content_parts:
+                    standardized_history.append(StandardizedMessage(role="assistant", content=assistant_standardized_content_parts))
+
+                final_response_text = " ".join(part.get("text","") for part in assistant_standardized_content_parts if part.get("type") == "text")
                 logger.info(f"Claude agentic call finished. Final text: {final_response_text[:200]}...")
-                break
+                break # Exit the while loop for tool calls
 
             tool_calls_count += 1
             if tool_calls_count >= MAX_TOOL_CALLS:
                 logger.warning("Reached maximum tool calls for Claude agentic interaction.")
+                # If the last turn was a tool request, we don't have a final text response from the model yet.
+                # The history will reflect the last tool call attempt.
+                # We might want to extract any text provided by the assistant *before* the tool call that hit the limit.
                 final_response_text = "Reached maximum tool calls."
-                if assistant_turn_content_blocks_for_history: # Likely the tool_use block that hit limit
-                     current_messages_history.append({"role": "assistant", "content": assistant_turn_content_blocks_for_history})
+                # If assistant_standardized_content_parts has text before the tool_use part that caused max_out:
+                text_before_max_tool_call = " ".join(p.get("text","") for p in assistant_standardized_content_parts if p.get("type") == "text")
+                if text_before_max_tool_call.strip():
+                    final_response_text = text_before_max_tool_call.strip() + " (Reached maximum tool calls)"
+
+                # Ensure the final (incomplete) assistant turn is added to history if it contained the maxed-out tool_use
+                if assistant_api_content_blocks and not claude_api_history[-1]['role'] == 'assistant':
+                     claude_api_history.append({"role": "assistant", "content": assistant_api_content_blocks})
+                if assistant_standardized_content_parts and not standardized_history[-1]['role'] == 'assistant':
+                     standardized_history.append(StandardizedMessage(role="assistant", content=assistant_standardized_content_parts))
                 break
 
         if return_full_response:
-            return {"prompt_id": prompt_id, "prompt": initial_prompt_text, "response": final_response_text,
-                    "full_conversation_history": current_messages_history, "tokens_in": accumulated_input_tokens,
-                    "tokens_out": accumulated_output_tokens, "model": model, "temperature": temperature,
-                    "top_p": top_p, "tool_calls_made": tool_calls_count}
+            return StandardizedAgenticResponse(
+                prompt_id=prompt_id,
+                prompt=initial_prompt_text,
+                response=final_response_text,
+                full_conversation_history=standardized_history,
+                tokens_in=accumulated_input_tokens,
+                tokens_out=accumulated_output_tokens,
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=kwargs.get('top_k'), # Claude doesn't use top_k directly in messages.create
+                tool_calls_made=tool_calls_count
+            )
         return final_response_text
 
-    def _get_hf_agentic(self, model: str, initial_prompt_text: str, **kwargs) -> Union[Dict[str, Any], str]:
-        logger.warning(f"HuggingFace agentic calls for model {model} are not yet implemented.")
-        raise NotImplementedError(f"HuggingFace agentic calls for model {model} are not yet implemented.")
+    def _get_hf_agentic(self, model_name: str, initial_prompt_text: str, **kwargs) -> Union[StandardizedAgenticResponse, str]:
+        """
+        Handles agentic interaction with a HuggingFace model, emulating MCP tool calls
+        through specific prompting strategies and output parsing.
+        Returns a standardized response structure if `return_full_response` is True in kwargs.
 
-    def _get_azure_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[Dict[str, Any], str]:
+        This method relies on the model's ability to follow instructions to format tool
+        call requests as JSON and to understand tool results provided in the prompt.
+
+        Args:
+            model_name (str): The name of the HuggingFace model (directory name under self.hf_model_dir)
+                              or a pre-loaded default model identifier.
+            initial_prompt_text (str): The initial user prompt text.
+            **kwargs: See `get_agentic` for other relevant kwargs like `return_full_response`,
+                      `prompt_id`, `system_prompt`, `temperature`, `max_tokens` (max_new_tokens for HF),
+                      `top_p`, `top_k`, `repetition_penalty`, `max_tool_calls`.
+
+        Returns:
+            Union[StandardizedAgenticResponse, str]:
+                If return_full_response is True, returns a StandardizedAgenticResponse TypedDict.
+                If False, returns only the final textual response string.
+        """
+        logger.info(f"Executing HuggingFace agentic call for model {model_name}")
+        self.mcp_client_manager.ensure_initialized()
+
+        # Parameters from kwargs
+        prompt_id = kwargs.get('prompt_id')
+        system_prompt_content = kwargs.get('system_prompt')
+        return_full_response = kwargs.get('return_full_response', False)
+        max_tool_calls = kwargs.get('max_tool_calls', 3) # Lower default for HF due to complexity
+
+        # Generation parameters for HF model
+        temperature = kwargs.get('temperature', 0.7)
+        max_new_tokens = kwargs.get('max_tokens', 512) # Max tokens for each generation step
+        top_p = kwargs.get('top_p', 0.9)
+        top_k = kwargs.get('top_k', 50)
+        repetition_penalty = kwargs.get('repetition_penalty', 1.1) # Common param name
+
+        hf_model = None
+        hf_tokenizer = None
+        actual_model_name_used = model_name
+
+        # --- Model Loading ---
+        # Consolidate model loading logic
+        if model_name == self.default_hf_completion_model and self.hf_completion_model and self.hf_completion_tokenizer:
+            logger.info(f"Using pre-loaded default HF completion model: {model_name}")
+            hf_model, hf_tokenizer = self.hf_completion_model, self.hf_completion_tokenizer
+            actual_model_name_used = self.default_hf_completion_model
+        elif model_name == self.default_hf_reasoning_model and hasattr(self, 'hf_reasoning_model') and self.hf_reasoning_model and hasattr(self, 'hf_reasoning_tokenizer') and self.hf_reasoning_tokenizer:
+            logger.info(f"Using pre-loaded default HF reasoning model: {model_name}")
+            hf_model, hf_tokenizer = self.hf_reasoning_model, self.hf_reasoning_tokenizer
+            actual_model_name_used = self.default_hf_reasoning_model
+        elif model_name: # Specific model requested, load on demand
+            logger.warning(f"Attempting to load HF model '{model_name}' on-demand for agentic call.")
+            model_path = self.hf_model_dir / model_name
+            if not model_path.is_dir():
+                raise FileNotFoundError(f"HuggingFace model directory not found: {model_path}")
+            try:
+                hf_tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True, trust_remote_code=True)
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    str(model_path), local_files_only=True, trust_remote_code=True,
+                    torch_dtype=torch.float16, device_map="auto"
+                )
+                if hf_tokenizer.pad_token is None: hf_tokenizer.pad_token = hf_tokenizer.eos_token
+                logger.info(f"Successfully loaded HF model '{model_name}' and tokenizer on-demand.")
+                actual_model_name_used = model_name
+            except Exception as e:
+                logger.error(f"Failed to load HF model '{model_name}' on-demand: {e}", exc_info=True)
+                raise ValueError(f"Could not load specified HF model: {model_name}") from e
+        else: # No specific model, try default completion, then default reasoning
+            logger.info("No specific HF model provided for agentic call, trying defaults.")
+            if self.hf_completion_model and self.hf_completion_tokenizer:
+                hf_model, hf_tokenizer = self.hf_completion_model, self.hf_completion_tokenizer
+                actual_model_name_used = self.default_hf_completion_model
+                logger.info(f"Using pre-loaded default HF completion model: {actual_model_name_used}")
+            elif hasattr(self, 'hf_reasoning_model') and self.hf_reasoning_model and hasattr(self, 'hf_reasoning_tokenizer') and self.hf_reasoning_tokenizer:
+                hf_model, hf_tokenizer = self.hf_reasoning_model, self.hf_reasoning_tokenizer
+                actual_model_name_used = self.default_hf_reasoning_model
+                logger.info(f"Using pre-loaded default HF reasoning model: {actual_model_name_used}")
+            else:
+                raise ValueError("No suitable default HuggingFace model (completion or reasoning) is pre-loaded/specified for agentic calls.")
+
+        if not hf_model or not hf_tokenizer:
+             raise ValueError(f"Failed to obtain a valid HuggingFace model and tokenizer for '{model_name}'.")
+
+        device = hf_model.device
+
+        # --- Histories & Tool Info ---
+        standardized_history: List[StandardizedMessage] = []
+        if system_prompt_content:
+            standardized_history.append(StandardizedMessage(role="system", content=system_prompt_content, name=None))
+        standardized_history.append(StandardizedMessage(role="user", content=initial_prompt_text, name=None))
+
+        available_tools_json_str = "No tools available."
+        if self.mcp_client_manager.available_tools:
+            formatted_tools_for_prompt = []
+            for tool_spec in self.mcp_client_manager.available_tools:
+                params = {name: schema.get("type", "any") for name, schema in tool_spec.get("input_schema", {}).get("properties", {}).items()}
+                formatted_tools_for_prompt.append({"name": tool_spec["name"], "description": tool_spec["description"], "parameters": params})
+            if formatted_tools_for_prompt:
+                 available_tools_json_str = json.dumps({"tools": formatted_tools_for_prompt}, indent=2)
+
+        # Construct the initial HF prompt string
+        current_hf_prompt_str = ""
+        if system_prompt_content: current_hf_prompt_str += f"System: {system_prompt_content}\n\n"
+        current_hf_prompt_str += f"You have access to the following tools:\n[AVAILABLE_TOOLS_START]\n{available_tools_json_str}\n[AVAILABLE_TOOLS_END]\n\n"
+        current_hf_prompt_str += "When you need to use a tool, you MUST respond with a JSON object formatted EXACTLY as follows, and nothing else:\n"
+        current_hf_prompt_str += "{\"tool_call\": {\"name\": \"<tool_name>\", \"arguments\": {\"<arg_name1>\": \"<value1>\"}}}\n"
+        current_hf_prompt_str += "If you do not need to use a tool, respond directly to the user.\n\n"
+        current_hf_prompt_str += f"User: {initial_prompt_text}\nAssistant:" # Start prompting for assistant's first response
+
+        final_response_text = ""
+        tool_calls_count = 0
+        accumulated_input_tokens = 0
+        accumulated_output_tokens = 0
+
+        # Determine if the loaded model was an on-demand one for later cleanup
+        was_loaded_on_demand = not (
+            (actual_model_name_used == self.default_hf_completion_model and hf_model == self.hf_completion_model and self.hf_completion_model is not None) or
+            (hasattr(self, 'hf_reasoning_model') and actual_model_name_used == self.default_hf_reasoning_model and hf_model == self.hf_reasoning_model and self.hf_reasoning_model is not None)
+        )
+        if not model_name: # If no specific model was given, it must have used a default (pre-loaded)
+            was_loaded_on_demand = False
+
+
+        for i in range(max_tool_calls + 1):
+            logger.debug(f"HF Agentic - Turn {i + 1} - Current Prompt for HF Model (last 1000 chars):\n...{current_hf_prompt_str[-1000:]}")
+
+            inputs = hf_tokenizer(current_hf_prompt_str, return_tensors="pt", padding=False, truncation=True, max_length=hf_tokenizer.model_max_length or 4096).to(device)
+            current_turn_input_tokens = inputs.input_ids.shape[1] # Tokens for this specific turn's input
+            accumulated_input_tokens += current_turn_input_tokens
+
+            generation_config = GenerationConfig(
+                max_new_tokens=max_new_tokens, do_sample=True, temperature=temperature, top_p=top_p, top_k=top_k,
+                repetition_penalty=repetition_penalty, pad_token_id=hf_tokenizer.pad_token_id,
+                eos_token_id=hf_tokenizer.eos_token_id,
+                # Consider adding stop sequences if model tends to hallucinate after JSON
+            )
+
+            with torch.no_grad():
+                outputs = hf_model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, generation_config=generation_config)
+
+            generated_ids = outputs[0][inputs.input_ids.shape[1]:]
+            raw_assistant_output = hf_tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            accumulated_output_tokens += len(generated_ids) # Tokens for this specific turn's output
+
+            logger.info(f"HF Model Raw Output (Turn {i+1}): '{raw_assistant_output}'")
+
+            tool_call_detected_this_turn = False
+            parsed_tool_call_data = None
+            text_part_from_assistant = raw_assistant_output
+
+            try:
+                # More robust JSON extraction: find first '{' and last '}'
+                json_start_index = raw_assistant_output.find("{")
+                json_end_index = raw_assistant_output.rfind("}")
+                if json_start_index != -1 and json_end_index != -1 and json_start_index < json_end_index:
+                    potential_json_str = raw_assistant_output[json_start_index : json_end_index+1]
+                    logger.debug(f"Potential JSON for tool call: {potential_json_str}")
+                    potential_json = json.loads(potential_json_str)
+                    if "tool_call" in potential_json and isinstance(potential_json["tool_call"], dict):
+                        tc_data = potential_json["tool_call"]
+                        if "name" in tc_data and "arguments" in tc_data and isinstance(tc_data["arguments"], dict):
+                            tool_call_detected_this_turn = True
+                            parsed_tool_call_data = tc_data
+                             # If there was text before the JSON, capture it. Otherwise, empty.
+                            text_part_from_assistant = raw_assistant_output[:json_start_index].strip()
+                            logger.info(f"Detected tool call: {parsed_tool_call_data['name']} with args {parsed_tool_call_data['arguments']}")
+                            if text_part_from_assistant:
+                                logger.info(f"Text preceding tool call: {text_part_from_assistant}")
+                        else:
+                            parsed_tool_call_data = None
+                else: # No JSON structure found
+                     logger.debug("No JSON-like structure found for tool call.")
+            except json.JSONDecodeError:
+                logger.debug("Output is not valid JSON or not a tool_call structure. Treating as text.")
+            except Exception as e_parse: # Catch any other parsing error
+                logger.error(f"Error parsing assistant output for tool call: {e_parse}", exc_info=True)
+
+
+            assistant_content_parts_for_std: List[StandardizedMessageContentPart] = []
+            if text_part_from_assistant:
+                 assistant_content_parts_for_std.append(StandardizedMessageContentPart(type="text", text=text_part_from_assistant))
+
+            if tool_call_detected_this_turn and parsed_tool_call_data:
+                assistant_content_parts_for_std.append(StandardizedMessageContentPart(
+                    type="tool_use", name=parsed_tool_call_data["name"], input=parsed_tool_call_data["arguments"]
+                    # 'id' for tool_use is optional in our schema, and HF emulation doesn't naturally provide one here.
+                ))
+
+            if assistant_content_parts_for_std:
+                standardized_history.append(StandardizedMessage(role="assistant", content=assistant_content_parts_for_std, name=actual_model_name_used))
+
+            current_hf_prompt_str += raw_assistant_output # Append raw output for next turn's prompt
+
+            if not tool_call_detected_this_turn:
+                final_response_text = text_part_from_assistant # This is the final answer
+                logger.info(f"HF Agentic: No tool call. Final response: {final_response_text[:200]}...")
+                break
+
+            # --- Handle Tool Call ---
+            tool_name = parsed_tool_call_data["name"]
+            tool_args = parsed_tool_call_data["arguments"]
+            tool_calls_count += 1
+
+            tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(tool_name))
+            tool_result_str_for_hf_prompt: str
+            tool_result_for_std_history: Union[str, Dict, List]
+            is_error_result = False
+
+            if tool_session:
+                try:
+                    mcp_tool_result = asyncio.run(tool_session.call_tool(tool_name, arguments=tool_args))
+                    tool_result_for_std_history = mcp_tool_result.content
+                    tool_result_str_for_hf_prompt = json.dumps(mcp_tool_result.content) if isinstance(mcp_tool_result.content, (dict, list)) else str(mcp_tool_result.content)
+                except Exception as e:
+                    error_msg = f"Error executing tool {tool_name}: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    tool_result_str_for_hf_prompt = json.dumps({"error": error_msg}) # Ensure result is JSON string for prompt
+                    tool_result_for_std_history = {"error": error_msg}
+                    is_error_result = True
+            else:
+                error_msg = f"Tool {tool_name} is not available or configured."
+                logger.warning(error_msg)
+                tool_result_str_for_hf_prompt = json.dumps({"error": error_msg})
+                tool_result_for_std_history = {"error": error_msg}
+                is_error_result = True
+
+            # Append structured tool result to HF prompt history
+            current_hf_prompt_str += f"\n[TOOL_RESULT_START]\n{{\"tool_name\": \"{tool_name}\", \"result\": {tool_result_str_for_hf_prompt}}}\n[TOOL_RESULT_END]\nAssistant:"
+
+            std_tool_msg_part = StandardizedMessageContentPart(type="tool_result", content=tool_result_for_std_history)
+            # tool_use_id is not available from HF emulated call request, so cannot be set here.
+            if is_error_result: std_tool_msg_part["is_error"] = True
+            standardized_history.append(StandardizedMessage(role="tool", name=tool_name, content=[std_tool_msg_part]))
+
+            if tool_calls_count >= max_tool_calls:
+                logger.warning("Reached maximum tool calls for HF agentic interaction.")
+                final_response_text = f"Reached maximum tool calls. Last tool '{tool_name}' was called with result: {tool_result_str_for_hf_prompt[:200]}..."
+                break
+
+        if was_loaded_on_demand: # Only cleanup if loaded on-demand
+             logger.info(f"Cleaning up on-demand loaded HF model '{actual_model_name_used}'.")
+             del hf_model
+             del hf_tokenizer
+             self._cleanup_memory(force=True)
+
+        if return_full_response:
+            return StandardizedAgenticResponse(
+                prompt_id=prompt_id, prompt=initial_prompt_text, response=final_response_text,
+                full_conversation_history=standardized_history,
+                tokens_in=accumulated_input_tokens, tokens_out=accumulated_output_tokens,
+                model=actual_model_name_used, temperature=temperature, top_p=top_p, top_k=top_k,
+                tool_calls_made=tool_calls_count
+            )
+        return final_response_text
+
+    def _get_azure_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[StandardizedAgenticResponse, str]:
         """
         Handles agentic interaction with an Azure OpenAI model, including MCP tool calls
         using Azure's function/tool calling capabilities.
+        Returns a standardized response structure if `return_full_response` is True in kwargs.
+
+        Args:
+            model (str): The Azure OpenAI deployment ID.
+            initial_messages (List[Dict[str, str]]): The initial messages for the conversation.
+            **kwargs: See `get_agentic` for other relevant kwargs like `return_full_response`,
+                      `prompt_id`, `system_prompt`, `temperature`, `max_tokens`, etc.
+
+        Returns:
+            Union[StandardizedAgenticResponse, str]: Standardized response or final text string.
         """
         logger.info(f"Executing Azure OpenAI agentic call for model {model} (deployment ID)")
         self.mcp_client_manager.ensure_initialized()
 
-        if not self.azure_endpoint or not (self.client_secret or self.subscription_key or os.getenv("AZURE_OPENAI_API_KEY")): # Check for API key too
-            # Allowing AZURE_OPENAI_API_KEY as a common way to set the key directly
+        if not self.azure_endpoint or not (self.client_secret or self.subscription_key or os.getenv("AZURE_OPENAI_API_KEY")):
             raise ValueError("Azure OpenAI credentials (Entra ID or API Key) or endpoint not fully configured for agentic calls.")
 
         temperature = kwargs.get('temperature', 0.7)
-        max_tokens_completion = kwargs.get('max_tokens', 2048) # Azure's max_tokens is for the completion part
+        max_tokens_completion = kwargs.get('max_tokens', 2048)
         top_p = kwargs.get('top_p', None)
         system_prompt_content = kwargs.get('system_prompt', None)
         prompt_id = kwargs.get('prompt_id', None)
         initial_prompt_text = initial_messages[0]['content'] if initial_messages and initial_messages[0]['role'] == 'user' else ""
         return_full_response = kwargs.get('return_full_response', False)
 
-        # Initialize AzureOpenAI client - supports both Entra ID (token) and API Key
-        if self.tenant_id and self.client_id and self.client_secret : # Entra ID
+        if self.tenant_id and self.client_id and self.client_secret :
             access_token = self.refresh_token()
-            client = AzureOpenAI(
-                api_version=self.api_version,
-                azure_endpoint=self.azure_endpoint,
-                azure_ad_token=access_token
-            )
+            client = AzureOpenAI(api_version=self.api_version, azure_endpoint=self.azure_endpoint, azure_ad_token=access_token)
             logger.info("Using Entra ID (token) for Azure OpenAI authentication.")
-        elif os.getenv("AZURE_OPENAI_API_KEY"): # API Key
-            client = AzureOpenAI(
-                api_version=self.api_version,
-                azure_endpoint=self.azure_endpoint,
-                api_key=os.getenv("AZURE_OPENAI_API_KEY")
-            )
+        elif os.getenv("AZURE_OPENAI_API_KEY"):
+            client = AzureOpenAI(api_version=self.api_version, azure_endpoint=self.azure_endpoint, api_key=os.getenv("AZURE_OPENAI_API_KEY"))
             logger.info("Using API Key for Azure OpenAI authentication.")
-        else: # Fallback if only subscription key was set for some other legacy reason (less common for chat)
-             client = AzureOpenAI(
-                api_version=self.api_version,
-                azure_endpoint=self.azure_endpoint,
-                api_key=self.subscription_key
-            )
+        else:
+             client = AzureOpenAI(api_version=self.api_version, azure_endpoint=self.azure_endpoint, api_key=self.subscription_key)
              logger.warning("Using subscription_key as API key for Azure OpenAI. Ensure this is intended.")
 
-
         final_response_text = ""
-        # Azure's usage field in response is more complex; direct accumulation might not be straightforward.
-        # We'd typically sum prompt_tokens and completion_tokens from each API call if needed.
         accumulated_prompt_tokens = 0
         accumulated_completion_tokens = 0
-
         MAX_TOOL_CALLS = kwargs.get('max_tool_calls', 5)
         tool_calls_count = 0
 
-        current_messages_history = []
+        azure_api_history = []
         if system_prompt_content:
-            current_messages_history.append({"role": "system", "content": system_prompt_content})
-        current_messages_history.extend(initial_messages)
+            azure_api_history.append({"role": "system", "content": system_prompt_content})
+        azure_api_history.extend(initial_messages)
+
+        standardized_history: List[StandardizedMessage] = []
+        if system_prompt_content:
+            standardized_history.append(StandardizedMessage(role="system", content=system_prompt_content, name=None))
+        for msg in initial_messages:
+            standardized_history.append(StandardizedMessage(role=msg["role"], content=msg["content"], name=None))
 
         azure_tools_formatted = []
         if self.mcp_client_manager.available_tools:
@@ -3846,7 +4234,7 @@ assistant_turn_content_blocks_for_history.append(content_block.model_dump())
                         "function": {
                             "name": mcp_tool["name"],
                             "description": mcp_tool["description"],
-                            "parameters": mcp_tool["input_schema"] # Assuming MCP schema is compatible
+                            "parameters": mcp_tool["input_schema"]
                         }
                     })
                 except KeyError as e:
@@ -3986,9 +4374,231 @@ def _get_azure_agentic(self, model: str, initial_messages: List[Dict[str, str]],
                     "tool_calls_made": tool_calls_count}
         return final_response_text
 
-    def _get_gemini_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[Dict[str, Any], str]:
-        logger.warning(f"Google Gemini agentic calls for model {model} are not yet implemented.")
-        raise NotImplementedError(f"Google Gemini agentic calls for model {model} are not yet implemented.")
+    def _get_gemini_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[StandardizedAgenticResponse, str]:
+        """
+        Handles agentic interaction with a Google Gemini model, including MCP tool calls.
+        Returns a standardized response structure if `return_full_response` is True in kwargs.
+
+        Args:
+            model (str): The Gemini model name (e.g., "gemini-1.5-flash").
+            initial_messages (List[Dict[str, str]]): The initial messages for the conversation.
+            **kwargs: See `get_agentic` for other relevant kwargs like `return_full_response`,
+                      `prompt_id`, `system_prompt`, `temperature`, `max_tokens`, etc.
+
+        Returns:
+            Union[StandardizedAgenticResponse, str]: Standardized response or final text string.
+        """
+        logger.info(f"Executing Gemini agentic call for model {model}")
+        self.mcp_client_manager.ensure_initialized() # Ensure MCP manager is ready
+
+        if not self.gemini_api_key:
+            raise ValueError("Google Gemini API key is not set. Please set the GEMINI_API_KEY environment variable.")
+
+        # Configure Gemini client (done globally in __init__ if api_key is present)
+        # genai.configure(api_key=self.gemini_api_key) # Already done if key exists
+        gemini_model = genai.GenerativeModel(model_name=model)
+
+        temperature = kwargs.get('temperature', 0.7)
+        max_output_tokens = kwargs.get('max_tokens', 2048) # Gemini uses max_output_tokens
+        top_p = kwargs.get('top_p', None)
+        top_k = kwargs.get('top_k', None)
+        system_prompt_content = kwargs.get('system_prompt', None) # Gemini uses system_instruction in GenerateContentConfig
+        prompt_id = kwargs.get('prompt_id', None)
+        initial_prompt_text = initial_messages[0]['content'] if initial_messages and initial_messages[0]['role'] == 'user' else ""
+        return_full_response = kwargs.get('return_full_response', False)
+
+        final_response_text = ""
+        # For Gemini, token counting is usually done via model.count_tokens() before/after.
+        # The response object might contain some usage metadata.
+        accumulated_prompt_tokens = 0
+        accumulated_candidates_tokens = 0 # Gemini uses this term
+
+        MAX_TOOL_CALLS = kwargs.get('max_tool_calls', 5)
+        tool_calls_count = 0
+
+        # History for Gemini API (native Content objects)
+        gemini_api_history: List[genai_types.Content] = []
+
+        # History for standardized output
+        standardized_history: List[StandardizedMessage] = []
+
+        # Handle initial system prompt for standardized history
+        if system_prompt_content:
+            standardized_history.append(StandardizedMessage(role="system", content=system_prompt_content, name=None))
+
+        # Convert initial messages to both Gemini's Content format and StandardizedMessage format
+        for msg in initial_messages:
+            role = msg["role"]
+            content = msg["content"]
+            # Add to Gemini API history
+            if role == "user":
+                gemini_api_history.append(genai_types.Content(role="user", parts=[genai_types.Part(text=content)]))
+            elif role == "assistant": # Standardized role, map to "model" for Gemini API
+                gemini_api_history.append(genai_types.Content(role="model", parts=[genai_types.Part(text=content)]))
+
+            # Add to standardized history
+            standardized_history.append(StandardizedMessage(role=role, content=content, name=None)) # Assuming simple text for initial messages
+
+        gemini_tools_formatted = []
+        if self.mcp_client_manager.available_tools:
+            for mcp_tool in self.mcp_client_manager.available_tools:
+                try:
+                    # MCP input_schema should be directly usable as Gemini's function parameters schema
+                    func_decl = genai_types.FunctionDeclaration(
+                        name=mcp_tool["name"],
+                        description=mcp_tool["description"],
+                        parameters=mcp_tool["input_schema"] # Assuming direct compatibility
+                    )
+                    gemini_tools_formatted.append(genai_types.Tool(function_declarations=[func_decl]))
+                except Exception as e:
+                    logger.warning(f"Skipping MCP tool {mcp_tool.get('name', 'Unknown')} for Gemini due to schema conversion issue: {e}")
+            logger.info(f"Gemini Agentic: Formatted {len(gemini_tools_formatted)} tools for Gemini API.")
+        else:
+            logger.info("Gemini Agentic: No MCP tools available/loaded.")
+
+        generation_config_dict = {
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+        }
+        if top_p is not None: generation_config_dict["top_p"] = top_p
+        if top_k is not None: generation_config_dict["top_k"] = top_k
+
+        safety_settings = [ # Example safety settings, adjust as needed
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        ]
+
+        while tool_calls_count < MAX_TOOL_CALLS:
+            logger.debug(f"Gemini API call ({tool_calls_count + 1}) with contents: {[c.to_dict() for c in gemini_api_history]}")
+
+            request_args = {
+                "contents": gemini_api_history,
+                "generation_config": genai_types.GenerationConfig(**generation_config_dict),
+                "safety_settings": safety_settings
+            }
+            # Add system_instruction only on the first turn if provided
+            if system_prompt_content and tool_calls_count == 0:
+                request_args["system_instruction"] = genai_types.Content(parts=[genai_types.Part(text=system_prompt_content)])
+
+            if gemini_tools_formatted:
+                request_args["tools"] = gemini_tools_formatted
+
+            try:
+                response = gemini_model.generate_content(**request_args)
+                if response.usage_metadata:
+                    accumulated_prompt_tokens += response.usage_metadata.prompt_token_count
+                    accumulated_candidates_tokens += response.usage_metadata.candidates_token_count
+            except Exception as e:
+                logger.error(f"Gemini API call failed: {e}", exc_info=True)
+                final_response_text = f"Error calling Gemini API: {e}"
+                break # Exit loop on API error
+
+            candidate = response.candidates[0] if response.candidates else None
+            if not candidate:
+                logger.error("Gemini response had no candidates.")
+                final_response_text = "Error: No response from Gemini model."
+                break
+
+            gemini_api_history.append(candidate.content) # Add model's response to API history
+
+            # Standardize assistant's response for standardized_history
+            assistant_content_parts_for_std: List[StandardizedMessageContentPart] = []
+            has_tool_call_this_turn = False
+
+            for part in candidate.content.parts:
+                if part.text:
+                    assistant_content_parts_for_std.append(StandardizedMessageContentPart(type="text", text=part.text))
+                if part.function_call:
+                    has_tool_call_this_turn = True
+                    function_call = part.function_call
+                    tool_name = function_call.name
+                    tool_args = dict(function_call.args)
+
+                    # Gemini doesn't provide a tool_call_id in the request part,
+                    # we'll generate one for internal tracking if needed, or rely on name for now.
+                    # For StandardizedMessageContentPart, 'id' is optional for 'tool_use'.
+                    assistant_content_parts_for_std.append(StandardizedMessageContentPart(
+                        type="tool_use", name=tool_name, input=tool_args # id is optional
+                    ))
+                    logger.info(f"Gemini Agentic: Requested tool '{tool_name}' with args: {tool_args}")
+
+                    tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(tool_name))
+                    tool_result_content_for_gemini_api: Any
+                    tool_result_content_for_standardized: Union[str, Dict, List]
+                    is_error_result = False
+
+                    if tool_session:
+                        try:
+                            mcp_tool_result = asyncio.run(tool_session.call_tool(tool_name, arguments=tool_args))
+                            tool_result_content_for_gemini_api = mcp_tool_result.content
+                            tool_result_content_for_standardized = mcp_tool_result.content
+                            logger.info(f"MCP Tool '{tool_name}' executed. Result type: {type(tool_result_content_for_gemini_api)}")
+                        except Exception as e:
+                            logger.error(f"Error calling MCP tool {tool_name} via Gemini: {e}", exc_info=True)
+                            error_payload = {"error": f"Error executing tool {tool_name}: {str(e)}"}
+                            tool_result_content_for_gemini_api = error_payload
+                            tool_result_content_for_standardized = error_payload
+                            is_error_result = True
+                    else:
+                        logger.warning(f"Tool {tool_name} requested by Gemini not found in MCPClientManager.")
+                        error_payload = {"error": f"Tool {tool_name} is not available or configured."}
+                        tool_result_content_for_gemini_api = error_payload
+                        tool_result_content_for_standardized = error_payload
+                        is_error_result = True
+
+                    # Add tool result to Gemini API history
+                    gemini_api_history.append(genai_types.Content(
+                        parts=[genai_types.Part.from_function_response(
+                            name=tool_name,
+                            response=tool_result_content_for_gemini_api
+                        )]
+                        # Gemini's 'user' role for function response is implicit by structure
+                    ))
+                    # Add tool result to Standardized history
+                    std_tool_result_part = StandardizedMessageContentPart(
+                        type="tool_result",
+                        # tool_use_id will be None as Gemini FC doesn't have IDs in request
+                        content=tool_result_content_for_standardized
+                    )
+                    if is_error_result: std_tool_result_part["is_error"] = True
+                    standardized_history.append(StandardizedMessage(role="tool", name=tool_name, content=[std_tool_result_part]))
+
+            # Add assistant's full turn (text and/or tool_use parts) to standardized_history
+            if assistant_content_parts_for_std:
+                 standardized_history.append(StandardizedMessage(role="assistant", content=assistant_content_parts_for_std, name=None))
+
+
+            if not has_tool_call_this_turn:
+                final_response_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
+                logger.info(f"Gemini agentic call finished. Final text: {final_response_text[:200]}...")
+                break # Exit while loop
+
+            tool_calls_count += 1
+            if tool_calls_count >= MAX_TOOL_CALLS:
+                logger.warning("Reached maximum tool calls for Gemini agentic interaction.")
+                final_response_text = "Reached maximum tool calls; processing stopped."
+                # Extract any text from the last assistant turn before maxing out
+                current_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text') and part.text)
+                if current_text: final_response_text = current_text + " (Reached maximum tool calls)"
+                break
+
+        if return_full_response:
+            return StandardizedAgenticResponse(
+                prompt_id=prompt_id,
+                prompt=initial_prompt_text,
+                response=final_response_text,
+                full_conversation_history=standardized_history,
+                tokens_in=accumulated_prompt_tokens,
+                tokens_out=accumulated_candidates_tokens, # Use candidates_token_count for output
+                model=model,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                tool_calls_made=tool_calls_count
+            )
+        return final_response_text
 
 # Make sure the original _get_claude_completion (previously _get_anthropic_completion) is the standard non-agentic one.
 # Based on the file content, it's named _get_claude_completion. Let's ensure it's correct.

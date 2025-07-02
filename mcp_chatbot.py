@@ -1,15 +1,31 @@
 from dotenv import load_dotenv
 from anthropic import Anthropic
-from mcp import ClientSession, StdioServerParameters
+# MCP imports
+from mcp import ClientSession as MCPClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from contextlib import AsyncExitStack
 import json
 import asyncio
 import nest_asyncio
+# import os # For environment variables # No longer needed if only for Gemini
+# import datetime # For example prompt # No longer needed if only for Gemini
+
+# Google Gemini imports
+# import google.generativeai as genai # No longer needed
+# from google.generativeai import types as genai_types # No longer needed
+
 
 nest_asyncio.apply()
 
 load_dotenv()
+
+# Configure Gemini API key - REMOVED
+# GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# if not GEMINI_API_KEY:
+#     print("Warning: GEMINI_API_KEY not found in environment variables.")
+# else:
+#     genai.configure(api_key=GEMINI_API_KEY)
+
 
 class MCP_ChatBot:
     def __init__(self):
@@ -30,7 +46,7 @@ class MCP_ChatBot:
             )
             read, write = stdio_transport
             session = await self.exit_stack.enter_async_context(
-                ClientSession(read, write)
+                MCPClientSession(read, write) # Use the aliased MCPClientSession
             )
             await session.initialize()
             
