@@ -3911,9 +3911,262 @@ class Encoder:
             )
         return final_response_text
 
-    def _get_hf_agentic(self, model: str, initial_prompt_text: str, **kwargs) -> Union[Dict[str, Any], str]:
-        logger.warning(f"HuggingFace agentic calls for model {model} are not yet implemented.")
-        raise NotImplementedError(f"HuggingFace agentic calls for model {model} are not yet implemented.")
+    def _get_hf_agentic(self, model_name: str, initial_prompt_text: str, **kwargs) -> Union[StandardizedAgenticResponse, str]:
+        """
+        Handles agentic interaction with a HuggingFace model, emulating MCP tool calls
+        through specific prompting strategies and output parsing.
+        Returns a standardized response structure if `return_full_response` is True in kwargs.
+
+        This method relies on the model's ability to follow instructions to format tool
+        call requests as JSON and to understand tool results provided in the prompt.
+
+        Args:
+            model_name (str): The name of the HuggingFace model (directory name under self.hf_model_dir)
+                              or a pre-loaded default model identifier.
+            initial_prompt_text (str): The initial user prompt text.
+            **kwargs: See `get_agentic` for other relevant kwargs like `return_full_response`,
+                      `prompt_id`, `system_prompt`, `temperature`, `max_tokens` (max_new_tokens for HF),
+                      `top_p`, `top_k`, `repetition_penalty`, `max_tool_calls`.
+
+        Returns:
+            Union[StandardizedAgenticResponse, str]:
+                If return_full_response is True, returns a StandardizedAgenticResponse TypedDict.
+                If False, returns only the final textual response string.
+        """
+        logger.info(f"Executing HuggingFace agentic call for model {model_name}")
+        self.mcp_client_manager.ensure_initialized()
+
+        # Parameters from kwargs
+        prompt_id = kwargs.get('prompt_id')
+        system_prompt_content = kwargs.get('system_prompt')
+        return_full_response = kwargs.get('return_full_response', False)
+        max_tool_calls = kwargs.get('max_tool_calls', 3) # Lower default for HF due to complexity
+
+        # Generation parameters for HF model
+        temperature = kwargs.get('temperature', 0.7)
+        max_new_tokens = kwargs.get('max_tokens', 512) # Max tokens for each generation step
+        top_p = kwargs.get('top_p', 0.9)
+        top_k = kwargs.get('top_k', 50)
+        repetition_penalty = kwargs.get('repetition_penalty', 1.1) # Common param name
+
+        hf_model = None
+        hf_tokenizer = None
+        actual_model_name_used = model_name
+
+        # --- Model Loading ---
+        # Consolidate model loading logic
+        if model_name == self.default_hf_completion_model and self.hf_completion_model and self.hf_completion_tokenizer:
+            logger.info(f"Using pre-loaded default HF completion model: {model_name}")
+            hf_model, hf_tokenizer = self.hf_completion_model, self.hf_completion_tokenizer
+            actual_model_name_used = self.default_hf_completion_model
+        elif model_name == self.default_hf_reasoning_model and hasattr(self, 'hf_reasoning_model') and self.hf_reasoning_model and hasattr(self, 'hf_reasoning_tokenizer') and self.hf_reasoning_tokenizer:
+            logger.info(f"Using pre-loaded default HF reasoning model: {model_name}")
+            hf_model, hf_tokenizer = self.hf_reasoning_model, self.hf_reasoning_tokenizer
+            actual_model_name_used = self.default_hf_reasoning_model
+        elif model_name: # Specific model requested, load on demand
+            logger.warning(f"Attempting to load HF model '{model_name}' on-demand for agentic call.")
+            model_path = self.hf_model_dir / model_name
+            if not model_path.is_dir():
+                raise FileNotFoundError(f"HuggingFace model directory not found: {model_path}")
+            try:
+                hf_tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True, trust_remote_code=True)
+                hf_model = AutoModelForCausalLM.from_pretrained(
+                    str(model_path), local_files_only=True, trust_remote_code=True,
+                    torch_dtype=torch.float16, device_map="auto"
+                )
+                if hf_tokenizer.pad_token is None: hf_tokenizer.pad_token = hf_tokenizer.eos_token
+                logger.info(f"Successfully loaded HF model '{model_name}' and tokenizer on-demand.")
+                actual_model_name_used = model_name
+            except Exception as e:
+                logger.error(f"Failed to load HF model '{model_name}' on-demand: {e}", exc_info=True)
+                raise ValueError(f"Could not load specified HF model: {model_name}") from e
+        else: # No specific model, try default completion, then default reasoning
+            logger.info("No specific HF model provided for agentic call, trying defaults.")
+            if self.hf_completion_model and self.hf_completion_tokenizer:
+                hf_model, hf_tokenizer = self.hf_completion_model, self.hf_completion_tokenizer
+                actual_model_name_used = self.default_hf_completion_model
+                logger.info(f"Using pre-loaded default HF completion model: {actual_model_name_used}")
+            elif hasattr(self, 'hf_reasoning_model') and self.hf_reasoning_model and hasattr(self, 'hf_reasoning_tokenizer') and self.hf_reasoning_tokenizer:
+                hf_model, hf_tokenizer = self.hf_reasoning_model, self.hf_reasoning_tokenizer
+                actual_model_name_used = self.default_hf_reasoning_model
+                logger.info(f"Using pre-loaded default HF reasoning model: {actual_model_name_used}")
+            else:
+                raise ValueError("No suitable default HuggingFace model (completion or reasoning) is pre-loaded/specified for agentic calls.")
+
+        if not hf_model or not hf_tokenizer:
+             raise ValueError(f"Failed to obtain a valid HuggingFace model and tokenizer for '{model_name}'.")
+
+        device = hf_model.device
+
+        # --- Histories & Tool Info ---
+        standardized_history: List[StandardizedMessage] = []
+        if system_prompt_content:
+            standardized_history.append(StandardizedMessage(role="system", content=system_prompt_content, name=None))
+        standardized_history.append(StandardizedMessage(role="user", content=initial_prompt_text, name=None))
+
+        available_tools_json_str = "No tools available."
+        if self.mcp_client_manager.available_tools:
+            formatted_tools_for_prompt = []
+            for tool_spec in self.mcp_client_manager.available_tools:
+                params = {name: schema.get("type", "any") for name, schema in tool_spec.get("input_schema", {}).get("properties", {}).items()}
+                formatted_tools_for_prompt.append({"name": tool_spec["name"], "description": tool_spec["description"], "parameters": params})
+            if formatted_tools_for_prompt:
+                 available_tools_json_str = json.dumps({"tools": formatted_tools_for_prompt}, indent=2)
+
+        # Construct the initial HF prompt string
+        current_hf_prompt_str = ""
+        if system_prompt_content: current_hf_prompt_str += f"System: {system_prompt_content}\n\n"
+        current_hf_prompt_str += f"You have access to the following tools:\n[AVAILABLE_TOOLS_START]\n{available_tools_json_str}\n[AVAILABLE_TOOLS_END]\n\n"
+        current_hf_prompt_str += "When you need to use a tool, you MUST respond with a JSON object formatted EXACTLY as follows, and nothing else:\n"
+        current_hf_prompt_str += "{\"tool_call\": {\"name\": \"<tool_name>\", \"arguments\": {\"<arg_name1>\": \"<value1>\"}}}\n"
+        current_hf_prompt_str += "If you do not need to use a tool, respond directly to the user.\n\n"
+        current_hf_prompt_str += f"User: {initial_prompt_text}\nAssistant:" # Start prompting for assistant's first response
+
+        final_response_text = ""
+        tool_calls_count = 0
+        accumulated_input_tokens = 0
+        accumulated_output_tokens = 0
+
+        # Determine if the loaded model was an on-demand one for later cleanup
+        was_loaded_on_demand = not (
+            (actual_model_name_used == self.default_hf_completion_model and hf_model == self.hf_completion_model and self.hf_completion_model is not None) or
+            (hasattr(self, 'hf_reasoning_model') and actual_model_name_used == self.default_hf_reasoning_model and hf_model == self.hf_reasoning_model and self.hf_reasoning_model is not None)
+        )
+        if not model_name: # If no specific model was given, it must have used a default (pre-loaded)
+            was_loaded_on_demand = False
+
+
+        for i in range(max_tool_calls + 1):
+            logger.debug(f"HF Agentic - Turn {i + 1} - Current Prompt for HF Model (last 1000 chars):\n...{current_hf_prompt_str[-1000:]}")
+
+            inputs = hf_tokenizer(current_hf_prompt_str, return_tensors="pt", padding=False, truncation=True, max_length=hf_tokenizer.model_max_length or 4096).to(device)
+            current_turn_input_tokens = inputs.input_ids.shape[1] # Tokens for this specific turn's input
+            accumulated_input_tokens += current_turn_input_tokens
+
+            generation_config = GenerationConfig(
+                max_new_tokens=max_new_tokens, do_sample=True, temperature=temperature, top_p=top_p, top_k=top_k,
+                repetition_penalty=repetition_penalty, pad_token_id=hf_tokenizer.pad_token_id,
+                eos_token_id=hf_tokenizer.eos_token_id,
+                # Consider adding stop sequences if model tends to hallucinate after JSON
+            )
+
+            with torch.no_grad():
+                outputs = hf_model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, generation_config=generation_config)
+
+            generated_ids = outputs[0][inputs.input_ids.shape[1]:]
+            raw_assistant_output = hf_tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            accumulated_output_tokens += len(generated_ids) # Tokens for this specific turn's output
+
+            logger.info(f"HF Model Raw Output (Turn {i+1}): '{raw_assistant_output}'")
+
+            tool_call_detected_this_turn = False
+            parsed_tool_call_data = None
+            text_part_from_assistant = raw_assistant_output
+
+            try:
+                # More robust JSON extraction: find first '{' and last '}'
+                json_start_index = raw_assistant_output.find("{")
+                json_end_index = raw_assistant_output.rfind("}")
+                if json_start_index != -1 and json_end_index != -1 and json_start_index < json_end_index:
+                    potential_json_str = raw_assistant_output[json_start_index : json_end_index+1]
+                    logger.debug(f"Potential JSON for tool call: {potential_json_str}")
+                    potential_json = json.loads(potential_json_str)
+                    if "tool_call" in potential_json and isinstance(potential_json["tool_call"], dict):
+                        tc_data = potential_json["tool_call"]
+                        if "name" in tc_data and "arguments" in tc_data and isinstance(tc_data["arguments"], dict):
+                            tool_call_detected_this_turn = True
+                            parsed_tool_call_data = tc_data
+                             # If there was text before the JSON, capture it. Otherwise, empty.
+                            text_part_from_assistant = raw_assistant_output[:json_start_index].strip()
+                            logger.info(f"Detected tool call: {parsed_tool_call_data['name']} with args {parsed_tool_call_data['arguments']}")
+                            if text_part_from_assistant:
+                                logger.info(f"Text preceding tool call: {text_part_from_assistant}")
+                        else:
+                            parsed_tool_call_data = None
+                else: # No JSON structure found
+                     logger.debug("No JSON-like structure found for tool call.")
+            except json.JSONDecodeError:
+                logger.debug("Output is not valid JSON or not a tool_call structure. Treating as text.")
+            except Exception as e_parse: # Catch any other parsing error
+                logger.error(f"Error parsing assistant output for tool call: {e_parse}", exc_info=True)
+
+
+            assistant_content_parts_for_std: List[StandardizedMessageContentPart] = []
+            if text_part_from_assistant:
+                 assistant_content_parts_for_std.append(StandardizedMessageContentPart(type="text", text=text_part_from_assistant))
+
+            if tool_call_detected_this_turn and parsed_tool_call_data:
+                assistant_content_parts_for_std.append(StandardizedMessageContentPart(
+                    type="tool_use", name=parsed_tool_call_data["name"], input=parsed_tool_call_data["arguments"]
+                    # 'id' for tool_use is optional in our schema, and HF emulation doesn't naturally provide one here.
+                ))
+
+            if assistant_content_parts_for_std:
+                standardized_history.append(StandardizedMessage(role="assistant", content=assistant_content_parts_for_std, name=actual_model_name_used))
+
+            current_hf_prompt_str += raw_assistant_output # Append raw output for next turn's prompt
+
+            if not tool_call_detected_this_turn:
+                final_response_text = text_part_from_assistant # This is the final answer
+                logger.info(f"HF Agentic: No tool call. Final response: {final_response_text[:200]}...")
+                break
+
+            # --- Handle Tool Call ---
+            tool_name = parsed_tool_call_data["name"]
+            tool_args = parsed_tool_call_data["arguments"]
+            tool_calls_count += 1
+
+            tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(tool_name))
+            tool_result_str_for_hf_prompt: str
+            tool_result_for_std_history: Union[str, Dict, List]
+            is_error_result = False
+
+            if tool_session:
+                try:
+                    mcp_tool_result = asyncio.run(tool_session.call_tool(tool_name, arguments=tool_args))
+                    tool_result_for_std_history = mcp_tool_result.content
+                    tool_result_str_for_hf_prompt = json.dumps(mcp_tool_result.content) if isinstance(mcp_tool_result.content, (dict, list)) else str(mcp_tool_result.content)
+                except Exception as e:
+                    error_msg = f"Error executing tool {tool_name}: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    tool_result_str_for_hf_prompt = json.dumps({"error": error_msg}) # Ensure result is JSON string for prompt
+                    tool_result_for_std_history = {"error": error_msg}
+                    is_error_result = True
+            else:
+                error_msg = f"Tool {tool_name} is not available or configured."
+                logger.warning(error_msg)
+                tool_result_str_for_hf_prompt = json.dumps({"error": error_msg})
+                tool_result_for_std_history = {"error": error_msg}
+                is_error_result = True
+
+            # Append structured tool result to HF prompt history
+            current_hf_prompt_str += f"\n[TOOL_RESULT_START]\n{{\"tool_name\": \"{tool_name}\", \"result\": {tool_result_str_for_hf_prompt}}}\n[TOOL_RESULT_END]\nAssistant:"
+
+            std_tool_msg_part = StandardizedMessageContentPart(type="tool_result", content=tool_result_for_std_history)
+            # tool_use_id is not available from HF emulated call request, so cannot be set here.
+            if is_error_result: std_tool_msg_part["is_error"] = True
+            standardized_history.append(StandardizedMessage(role="tool", name=tool_name, content=[std_tool_msg_part]))
+
+            if tool_calls_count >= max_tool_calls:
+                logger.warning("Reached maximum tool calls for HF agentic interaction.")
+                final_response_text = f"Reached maximum tool calls. Last tool '{tool_name}' was called with result: {tool_result_str_for_hf_prompt[:200]}..."
+                break
+
+        if was_loaded_on_demand: # Only cleanup if loaded on-demand
+             logger.info(f"Cleaning up on-demand loaded HF model '{actual_model_name_used}'.")
+             del hf_model
+             del hf_tokenizer
+             self._cleanup_memory(force=True)
+
+        if return_full_response:
+            return StandardizedAgenticResponse(
+                prompt_id=prompt_id, prompt=initial_prompt_text, response=final_response_text,
+                full_conversation_history=standardized_history,
+                tokens_in=accumulated_input_tokens, tokens_out=accumulated_output_tokens,
+                model=actual_model_name_used, temperature=temperature, top_p=top_p, top_k=top_k,
+                tool_calls_made=tool_calls_count
+            )
+        return final_response_text
 
     def _get_azure_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[StandardizedAgenticResponse, str]:
         """
