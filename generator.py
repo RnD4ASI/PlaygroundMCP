@@ -57,7 +57,16 @@ from google.generativeai import types
 from anthropic import Anthropic
 from mistralai import Mistral
 # Optional MLX support for Apple-Silicon / CPU inference
-from mlx_lm import load as mlx_load, generate as mlx_generate
+try:
+    from mlx_lm import load as mlx_load, generate as mlx_generate
+except ImportError:
+    mlx_load, mlx_generate = None, None
+    logger.debug("mlx_lm not found, MLX support disabled.")
+
+# Google Gemini imports (ensure they are here)
+import google.generativeai as genai
+from google.generativeai import types as genai_types
+
 from src.pipeline.shared.logging import get_logger
 from src.pipeline.shared.utility import DataUtility, StatisticsUtility, AIUtility, MemoryUtility
 
@@ -3987,8 +3996,175 @@ def _get_azure_agentic(self, model: str, initial_messages: List[Dict[str, str]],
         return final_response_text
 
     def _get_gemini_agentic(self, model: str, initial_messages: List[Dict[str, str]], **kwargs) -> Union[Dict[str, Any], str]:
-        logger.warning(f"Google Gemini agentic calls for model {model} are not yet implemented.")
-        raise NotImplementedError(f"Google Gemini agentic calls for model {model} are not yet implemented.")
+        logger.info(f"Executing Gemini agentic call for model {model}")
+        self.mcp_client_manager.ensure_initialized() # Ensure MCP manager is ready
+
+        if not self.gemini_api_key:
+            raise ValueError("Google Gemini API key is not set. Please set the GEMINI_API_KEY environment variable.")
+
+        # Configure Gemini client (done globally in __init__ if api_key is present)
+        # genai.configure(api_key=self.gemini_api_key) # Already done if key exists
+        gemini_model = genai.GenerativeModel(model_name=model)
+
+        temperature = kwargs.get('temperature', 0.7)
+        max_output_tokens = kwargs.get('max_tokens', 2048) # Gemini uses max_output_tokens
+        top_p = kwargs.get('top_p', None)
+        top_k = kwargs.get('top_k', None)
+        system_prompt_content = kwargs.get('system_prompt', None) # Gemini uses system_instruction in GenerateContentConfig
+        prompt_id = kwargs.get('prompt_id', None)
+        initial_prompt_text = initial_messages[0]['content'] if initial_messages and initial_messages[0]['role'] == 'user' else ""
+        return_full_response = kwargs.get('return_full_response', False)
+
+        final_response_text = ""
+        # For Gemini, token counting is usually done via model.count_tokens() before/after.
+        # The response object might contain some usage metadata, but it's not as direct as OpenAI/Anthropic for accumulation.
+        accumulated_input_tokens = 0 # Placeholder
+        accumulated_output_tokens = 0 # Placeholder
+
+        MAX_TOOL_CALLS = kwargs.get('max_tool_calls', 5)
+        tool_calls_count = 0
+
+        # Convert initial_messages to Gemini's content format
+        # Gemini expects a list of Content objects. User parts are straightforward.
+        # System prompt is handled differently.
+        current_gemini_contents = []
+        for msg in initial_messages:
+            if msg['role'] == 'user':
+                current_gemini_contents.append(genai_types.Content(role='user', parts=[genai_types.Part(text=msg['content'])]))
+            elif msg['role'] == 'assistant': # or 'model' for Gemini
+                 # If assistant message has tool calls, it's more complex. For now, assume simple text.
+                current_gemini_contents.append(genai_types.Content(role='model', parts=[genai_types.Part(text=msg['content'])]))
+
+
+        gemini_tools_formatted = []
+        if self.mcp_client_manager.available_tools:
+            for mcp_tool in self.mcp_client_manager.available_tools:
+                try:
+                    # MCP input_schema should be directly usable as Gemini's function parameters schema
+                    func_decl = genai_types.FunctionDeclaration(
+                        name=mcp_tool["name"],
+                        description=mcp_tool["description"],
+                        parameters=mcp_tool["input_schema"] # Assuming direct compatibility
+                    )
+                    gemini_tools_formatted.append(genai_types.Tool(function_declarations=[func_decl]))
+                except Exception as e:
+                    logger.warning(f"Skipping MCP tool {mcp_tool.get('name', 'Unknown')} for Gemini due to schema conversion issue: {e}")
+            logger.info(f"Gemini Agentic: Formatted {len(gemini_tools_formatted)} tools for Gemini API.")
+        else:
+            logger.info("Gemini Agentic: No MCP tools available/loaded.")
+
+        generation_config_dict = {
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+        }
+        if top_p is not None: generation_config_dict["top_p"] = top_p
+        if top_k is not None: generation_config_dict["top_k"] = top_k
+
+        safety_settings = [ # Example safety settings, adjust as needed
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        ]
+
+        while tool_calls_count < MAX_TOOL_CALLS:
+            logger.debug(f"Gemini API call ({tool_calls_count + 1}) with contents: {current_gemini_contents}")
+
+            # Construct GenerateContentRequest arguments
+            request_args = {
+                "contents": current_gemini_contents,
+                "generation_config": genai_types.GenerationConfig(**generation_config_dict),
+                "safety_settings": safety_settings
+            }
+            if system_prompt_content and tool_calls_count == 0: # System instruction only for first turn typically
+                request_args["system_instruction"] = genai_types.Content(parts=[genai_types.Part(text=system_prompt_content)])
+
+            if gemini_tools_formatted:
+                request_args["tools"] = gemini_tools_formatted
+
+            try:
+                # Use async client if available and if this method is called from an async context
+                # For simplicity in a sync method, using the sync client.
+                # If Generator becomes fully async, this should be `gemini_model.generate_content_async`
+                response = gemini_model.generate_content(**request_args)
+            except Exception as e:
+                logger.error(f"Gemini API call failed: {e}", exc_info=True)
+                final_response_text = f"Error calling Gemini API: {e}"
+                break
+
+
+            # Process response.candidates[0].content.parts
+            candidate = response.candidates[0] if response.candidates else None
+            if not candidate:
+                logger.error("Gemini response had no candidates.")
+                final_response_text = "Error: No response from Gemini model."
+                break
+
+            # Add model's response to history (parts)
+            current_gemini_contents.append(candidate.content)
+
+            has_tool_call_this_turn = False
+            for part in candidate.content.parts:
+                if part.function_call:
+                    has_tool_call_this_turn = True
+                    function_call = part.function_call
+                    tool_name = function_call.name
+                    tool_args = dict(function_call.args) # Convert MapComposite to dict
+
+                    logger.info(f"Gemini Agentic: Function call to '{tool_name}' with args: {tool_args}")
+
+                    tool_session = asyncio.run(self.mcp_client_manager.get_tool_session(tool_name))
+                    tool_result_content_for_gemini = None
+
+                    if tool_session:
+                        try:
+                            mcp_tool_result = asyncio.run(tool_session.call_tool(tool_name, arguments=tool_args))
+                            # Gemini expects the result content directly, not stringified if it's structured
+                            tool_result_content_for_gemini = mcp_tool_result.content
+                            logger.info(f"MCP Tool '{tool_name}' executed. Result type: {type(tool_result_content_for_gemini)}")
+                        except Exception as e:
+                            logger.error(f"Error calling MCP tool {tool_name} via Gemini: {e}", exc_info=True)
+                            tool_result_content_for_gemini = {"error": f"Error executing tool {tool_name}: {str(e)}"}
+                    else:
+                        logger.warning(f"Tool {tool_name} requested by Gemini not found in MCPClientManager.")
+                        tool_result_content_for_gemini = {"error": f"Tool {tool_name} is not available or configured."}
+
+                    # Append function response part to current_gemini_contents
+                    current_gemini_contents.append(
+                        genai_types.Content(parts=[genai_types.Part.from_function_response(
+                            name=tool_name,
+                            response=tool_result_content_for_gemini
+                        )])
+                    )
+                    break # Process one tool call per turn, then resend
+
+            if not has_tool_call_this_turn:
+                # Extract final text if no tool calls
+                final_response_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
+                logger.info(f"Gemini agentic call finished. Final text: {final_response_text[:200]}...")
+                break
+
+            tool_calls_count += 1
+            if tool_calls_count >= MAX_TOOL_CALLS:
+                logger.warning("Reached maximum tool calls for Gemini agentic interaction.")
+                final_response_text = "Reached maximum tool calls; processing stopped."
+                # Potentially get the last text part if any before breaking
+                final_response_text = "".join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
+                break
+
+        # TODO: Token counting for Gemini is typically via model.count_tokens(contents).
+        # This would require counting tokens for current_gemini_contents before and after the final response.
+        # For now, input/output tokens are placeholders.
+
+        if return_full_response:
+            # Gemini's history format is already `current_gemini_contents`
+            return {"prompt_id": prompt_id, "prompt": initial_prompt_text, "response": final_response_text,
+                    "full_conversation_history": [c.to_dict() for c in current_gemini_contents], # Convert Content objects to dicts
+                    "tokens_in": accumulated_input_tokens, # Placeholder
+                    "tokens_out": accumulated_output_tokens, # Placeholder
+                    "model": model, "temperature": temperature, "top_p": top_p, "top_k": top_k,
+                    "tool_calls_made": tool_calls_count}
+        return final_response_text
 
 # Make sure the original _get_claude_completion (previously _get_anthropic_completion) is the standard non-agentic one.
 # Based on the file content, it's named _get_claude_completion. Let's ensure it's correct.
